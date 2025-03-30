@@ -1,1 +1,1 @@
-# dirichlet_process_mixture_models
+# Dirichlet Process Mixture Models
