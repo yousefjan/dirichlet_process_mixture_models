@@ -1,438 +1,326 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy import stats
-from scipy.special import logsumexp, gammaln
-from collections import Counter
+from matplotlib import animation
+from scipy.stats import multivariate_normal, invwishart, multivariate_t
 from tqdm import tqdm
-
+from collections import Counter
 
 class DirichletProcessMixtureModel:
-    """
-    Dirichlet Process Mixture Model (DPMM) with Gaussian components using collapsed Gibbs sampling for inference. 
-    Normal-Inverse-Wishart priors for the Gaussian components.
-    """
-    def __init__(self, alpha=1.0, mu_0=None, kappa_0=1.0, nu_0=None, lambda_0=None):
+    def __init__(self, data, alpha=1.0, mu0=None, kappa0=1.0, nu0=None, Lambda0=None):
+        """
+        Multivariate Dirichlet process mixture model (DPMM) with Gaussian components using collapsed Gibbs sampling for inference. 
+        """
+        self.data = np.asarray(data)
+        self.n, self.d = self.data.shape
+        
         self.alpha = alpha
-        self.mu_0 = mu_0
-        self.kappa_0 = kappa_0
-        self.nu_0 = nu_0
-        self.lambda_0 = lambda_0
         
-        self.cluster_assignments = None
-        self.n_clusters = 0
-        self.cluster_params = {}
-        self.cluster_counts = Counter()
-        self.data = None
-        self.d = None  # dimensionality
-        self.n = None  # number of data points
-        
-    def _initialize_hyperparameters(self, X):
-        """
-        Initialize hyperparameters.
-        """
-        self.d = X.shape[1]
-        self.n = X.shape[0]
-        
-        if self.mu_0 is None:
-            self.mu_0 = np.zeros(self.d)
-        
-        if self.nu_0 is None:
-            self.nu_0 = self.d + 2
+        if mu0 is None:
+            self.mu0 = np.mean(self.data, axis=0)
+        else:
+            self.mu0 = mu0
             
-        if self.lambda_0 is None:
-            self.lambda_0 = np.eye(self.d)
-    
-    def _log_predictive_likelihood(self, x, cluster_id):
-        """
-        Compute the log predictive likelihood of a data point under the cluster_id-th cluster.
+        self.kappa0 = kappa0
         
-        This uses the posterior predictive distribution, which is a multivariate t-distribution
-        for the Normal-Inverse-Wishart prior.
-        """
-        if cluster_id not in self.cluster_params:
-            # New cluster - use prior
-            mu_n = self.mu_0
-            kappa_n = self.kappa_0
-            nu_n = self.nu_0
-            lambda_n = self.lambda_0
+        if nu0 is None:
+            self.nu0 = self.d + 2
         else:
-            # Old cluster - use posterior
-            mu_n, kappa_n, nu_n, lambda_n = self.cluster_params[cluster_id]
-        
-        mu = mu_n
-        sigma = lambda_n * (kappa_n + 1) / (kappa_n * (nu_n - self.d + 1))
-        df = nu_n - self.d + 1
-        
-        return stats.multivariate_t.logpdf(x, loc=mu, shape=sigma, df=df)
-    
-    def _sample_cluster_assignment(self, i):
-        """
-        Sample a cluster assignment for data point at i-th index using collapsed Gibbs sampling.
-        """
-        x = self.data[i]
-        current_cluster = self.cluster_assignments[i]
-        
-        if current_cluster is not None:
-            self.cluster_counts[current_cluster] -= 1
-            if self.cluster_counts[current_cluster] == 0:
-                del self.cluster_counts[current_cluster]
-                del self.cluster_params[current_cluster]
-        
-        log_probs = []
-        cluster_ids = list(self.cluster_counts.keys())
-        
-        for cluster_id in cluster_ids:
-            # CRP prior probability
-            log_prior = np.log(self.cluster_counts[cluster_id])
-            # likelihood
-            log_likelihood = self._log_predictive_likelihood(x, cluster_id)
-            log_probs.append(log_prior + log_likelihood)
-        
-        log_prior_new = np.log(self.alpha)
-        log_likelihood_new = self._log_predictive_likelihood(x, None)  # New cluster
-        log_probs.append(log_prior_new + log_likelihood_new)
-        
-        log_probs = np.array(log_probs)
-        log_probs -= logsumexp(log_probs)
-        probs = np.exp(log_probs)
-        
-        if len(cluster_ids) == 0:
-            new_cluster = 0  # First cluster
+            self.nu0 = nu0
+            
+        if Lambda0 is None:
+            self.Lambda0 = np.eye(self.d)
         else:
-            choice = np.random.choice(len(probs), p=probs)
-            if choice == len(cluster_ids):  # New cluster
-                new_cluster = max(cluster_ids) + 1 if cluster_ids else 0
-            else:
-                new_cluster = cluster_ids[choice]
+            self.Lambda0 = Lambda0
         
-        self.cluster_assignments[i] = new_cluster
-        self.cluster_counts[new_cluster] += 1
+        # We start with each point in its own cluster.
+        self.z = np.arange(self.n)
+        # {cluster_label: (mu, Sigma)}
+        self.params = {i: (self.data[i], np.eye(self.d)) for i in range(self.n)}
         
-        self._update_cluster_params(new_cluster)
+        self.cluster_history = [len(np.unique(self.z))]
+        self.assignment_history = [self.z.copy()]
         
-        return new_cluster
+        self.n_clusters = len(np.unique(self.z))
+        self.cluster_counts = Counter(self.z)
+        self.cluster_assignments = {}
     
-    def _update_cluster_params(self, cluster_id):
+    def _posterior_niw(self, X):
         """
-        Update the posterior parameters for a cluster.
+        Compute the posterior NIW parameters given data X assigned to a cluster.
+        X: array of shape (n_k, d)
+        Returns: (mu_n, kappa_n, nu_n, Lambda_n)
         """
-        cluster_points = self.data[self.cluster_assignments == cluster_id]
-        n_points = len(cluster_points)
+        n_k = X.shape[0]
+        if n_k == 0:
+            raise ValueError("No data in cluster for NIW update.")
         
-        if n_points == 0:
+        x_bar = np.mean(X, axis=0)
+        S = np.zeros((self.d, self.d))
+        if n_k > 1:
+            X_centered = X - x_bar
+            S = X_centered.T @ X_centered
+        
+        kappa_n = self.kappa0 + n_k
+        mu_n = (self.kappa0 * self.mu0 + n_k * x_bar) / kappa_n
+        nu_n = self.nu0 + n_k
+        # The updated scale matrix for the Inverse-Wishart
+        diff = (x_bar - self.mu0).reshape(-1, 1)
+        Lambda_n = self.Lambda0 + S + (self.kappa0 * n_k / kappa_n) * (diff @ diff.T)
+        return mu_n, kappa_n, nu_n, Lambda_n
+    
+    def _sample_cluster_params(self, X):
+        """
+        Given data X for a cluster, sample new (mu, Sigma) from the NIW posterior.
+        """
+        mu_n, kappa_n, nu_n, Lambda_n = self._posterior_niw(X)
+        # Sample covariance from Inverse-Wishart
+        Sigma = invwishart.rvs(df=nu_n, scale=Lambda_n)
+        # Sample mean from multivariate normal
+        mu = np.random.multivariate_normal(mu_n, Sigma / kappa_n)
+        return mu, Sigma
+    
+    def _predictive_density(self, x):
+        """
+        Compute the predictive density for x under a new cluster using the NIW prior.
+        The predictive density is a multivariate t-distribution with:
+          - location: mu0
+          - shape: (kappa0+1)/(kappa0*(nu0-d+1)) * Lambda0
+          - degrees of freedom: nu0-d+1
+        """
+        df = self.nu0 - self.d + 1
+        scale = (self.kappa0 + 1) / (self.kappa0 * df) * self.Lambda0
+        return multivariate_t.pdf(x, loc=self.mu0, shape=scale, df=df)
+    
+    def run(self, n_iter=300):
+        """
+        Run the Gibbs sampler for n_iter iterations.
+        """
+        for it in tqdm(range(n_iter), desc="DPMM Sampling"):
+            for i in range(self.n):
+                # Remove x_i from its cluster.
+                curr_cluster = self.z[i]
+                idx = np.where(self.z == curr_cluster)[0]
+                idx = idx[idx != i]
+                if len(idx) == 0:
+                    # Remove empty cluster from parameters.
+                    if curr_cluster in self.params:
+                        del self.params[curr_cluster]
+                self.z[i] = -1  # temporary placeholder
+
+                # List current clusters.
+                clusters = list(self.params.keys())
+                probs = []
+
+                # Compute probability for each existing cluster.
+                for k in clusters:
+                    # Get all data points currently assigned to cluster k.
+                    X_k = self.data[self.z == k]
+                    n_k = X_k.shape[0]
+                    # Likelihood of x_i given cluster k parameters.
+                    mu_k, Sigma_k = self.params[k]
+                    likelihood = multivariate_normal.pdf(self.data[i], mean=mu_k, cov=Sigma_k)
+                    probs.append(n_k * likelihood)
+                
+                # Probability for a new cluster (using the NIW predictive density)
+                new_prob = self.alpha * self._predictive_density(self.data[i])
+                probs.append(new_prob)
+                
+                probs = np.array(probs)
+                probs /= np.sum(probs)
+                # Sample a new assignment for x_i.
+                choice = np.random.choice(len(probs), p=probs)
+                if choice == len(clusters):
+                    # Create a new cluster.
+                    new_cluster_label = max(clusters) + 1 if clusters else 0
+                    self.z[i] = new_cluster_label
+                    # For a new cluster, use the data point alone to sample parameters.
+                    self.params[new_cluster_label] = self._sample_cluster_params(np.array([self.data[i]]))
+                else:
+                    self.z[i] = clusters[choice]
+            
+            # After reassigning all points, update the parameters for each cluster.
+            unique_clusters = np.unique(self.z)
+            for k in unique_clusters:
+                idx = np.where(self.z == k)[0]
+                X_k = self.data[idx]
+                self.params[k] = self._sample_cluster_params(X_k)
+            
+            self.cluster_history.append(len(np.unique(self.z)))
+            self.assignment_history.append(self.z.copy())
+        
+        # Update n_clusters and cluster_counts after all iterations
+        self.n_clusters = len(np.unique(self.z))
+        self.cluster_counts = Counter(self.z)
+        self.cluster_assignments = self.z.copy()
+    
+    def plot_clusters(self):
+        """
+        If the data is 2D, plot the clusters.
+        """
+        if self.d != 2:
+            print("Plotting is only supported for 2D data.")
             return
         
-        x_bar = np.mean(cluster_points, axis=0)
-        S = np.zeros((self.d, self.d))
-        if n_points > 1:
-            centered = cluster_points - x_bar
-            S = centered.T @ centered
-        
-        # Update posterior parameters
-        kappa_n = self.kappa_0 + n_points
-        nu_n = self.nu_0 + n_points
-        mu_n = (self.kappa_0 * self.mu_0 + n_points * x_bar) / kappa_n
-        
-        # Update lambda (scale matrix)
-        mu_diff = x_bar - self.mu_0
-        lambda_n = self.lambda_0 + S + (self.kappa_0 * n_points / kappa_n) * np.outer(mu_diff, mu_diff)
-        
-        self.cluster_params[cluster_id] = (mu_n, kappa_n, nu_n, lambda_n)
+        clusters = np.unique(self.z)
+        colors = plt.cm.tab10(np.linspace(0, 1, len(clusters)))
+        plt.figure(figsize=(8,6))
+        for k, c in zip(clusters, colors):
+            idx = np.where(self.z == k)[0]
+            plt.scatter(self.data[idx, 0], self.data[idx, 1], color=c, label=f"Cluster {k}")
+            # Plot an ellipse for the covariance (optional; here we mark the mean)
+            mu_k, _ = self.params[k]
+            plt.scatter(mu_k[0], mu_k[1], marker="x", s=200, color=c)
+        plt.xlabel("Dimension 1")
+        plt.ylabel("Dimension 2")
+        plt.title("DPMM Clusters (Multivariate with NIW Prior)")
+        plt.legend()
+        plt.show()
     
-    def fit(self, X, n_iter=1000, burn_in=500, thin=1, verbose=True):
+    def plot_trace(self):
         """
-        Fit the Dirichlet Process Mixture Model to the data (X) using Gibbs sampling.
+        Plot the trace of the number of clusters over iterations.
         """
-        self.data = np.asarray(X)
-        self._initialize_hyperparameters(X)
-        
-        self.n = X.shape[0]
-        self.cluster_assignments = np.zeros(self.n, dtype=int)
-        
-        self.cluster_counts = Counter({0: self.n})
-        self._update_cluster_params(0)
-        
-        self.samples = []
-        
-        # Gibbs sampling
-        iterator = range(n_iter)
-        if verbose:
-            iterator = tqdm(iterator, desc="DPMM Gibbs Sampling")
-            
-        for iter_idx in iterator:
-            for i in range(self.n):
-                self._sample_cluster_assignment(i)
-            
-            if iter_idx >= burn_in and (iter_idx - burn_in) % thin == 0:
-                self.samples.append(self.cluster_assignments.copy())
-                
-            if verbose and iter_idx % 100 == 0:
-                n_clusters = len(self.cluster_counts)
-                if hasattr(iterator, 'set_postfix'):
-                    iterator.set_postfix({"n_clusters": n_clusters})
-        
-        self.cluster_assignments = self.samples[-1]
-        self.n_clusters = len(set(self.cluster_assignments))
-        
-        return self
+        plt.figure(figsize=(8,4))
+        plt.plot(self.cluster_history, marker='o')
+        plt.xlabel("Iteration")
+        plt.ylabel("Number of clusters")
+        plt.title("Trace of Number of Clusters")
+        plt.show()
     
-    def predict(self, X_new):
-        """
-        Predict cluster labels for new data points in X_new.
-        """
-        X_new = np.asarray(X_new)
-        n_new = X_new.shape[0]
-        predictions = np.zeros(n_new, dtype=int)
-        
-        for i in range(n_new):
-            x = X_new[i]
-            
-            log_probs = []
-            cluster_ids = list(self.cluster_counts.keys())
-            
-            for cluster_id in cluster_ids:
-                # CRP prior probability
-                log_prior = np.log(self.cluster_counts[cluster_id])
-                # Likelihood
-                log_likelihood = self._log_predictive_likelihood(x, cluster_id)
-                log_probs.append(log_prior + log_likelihood)
-            
-            log_prior_new = np.log(self.alpha)
-            log_likelihood_new = self._log_predictive_likelihood(x, None)
-            log_probs.append(log_prior_new + log_likelihood_new)
-            
-            log_probs = np.array(log_probs)
-            log_probs -= logsumexp(log_probs)
-            
-            # Choose the most likely cluster
-            max_idx = np.argmax(log_probs)
-            if max_idx == len(cluster_ids):  # New cluster
-                predictions[i] = -1  # Indicate a new cluster
-            else:
-                predictions[i] = cluster_ids[max_idx]
-        
-        return predictions
-    
-    def posterior_predictive(self, X_new, n_samples=100):
-        """
-        Compute the posterior predictive distribution for new data points.
-        """
-        X_new = np.asarray(X_new)
-        n_new = X_new.shape[0]
-        
-        posterior_samples = self.samples[-n_samples:]
-        
-        predictions = np.zeros((n_new, len(posterior_samples)), dtype=int)
-        
-        for s_idx, sample in enumerate(posterior_samples):
-            orig_assignments = self.cluster_assignments.copy()
-            self.cluster_assignments = sample
-            
-            self.cluster_counts = Counter(sample)
-            for cluster_id in set(sample):
-                self._update_cluster_params(cluster_id)
-            
-            for i in range(n_new):
-                x = X_new[i]
-                
-                log_probs = []
-                cluster_ids = list(self.cluster_counts.keys())
-                
-                for cluster_id in cluster_ids:
-                    # CRP prior probability
-                    log_prior = np.log(self.cluster_counts[cluster_id])
-                    # Likelihood
-                    log_likelihood = self._log_predictive_likelihood(x, cluster_id)
-                    log_probs.append(log_prior + log_likelihood)
-                
-                log_prior_new = np.log(self.alpha)
-                log_likelihood_new = self._log_predictive_likelihood(x, None)
-                log_probs.append(log_prior_new + log_likelihood_new)
-                
-                log_probs = np.array(log_probs)
-                log_probs -= logsumexp(log_probs)
-                probs = np.exp(log_probs)
-                
-                if len(cluster_ids) == 0:
-                    predictions[i, s_idx] = -1  # New cluster
-                else:
-                    choice = np.random.choice(len(probs), p=probs)
-                    if choice == len(cluster_ids):  # New cluster
-                        predictions[i, s_idx] = -1
-                    else:
-                        predictions[i, s_idx] = cluster_ids[choice]
-            
-            self.cluster_assignments = orig_assignments
-            
-        return predictions
-    
-    def plot_clusters(self, X=None, dims=[0, 1], figsize=(10, 8), alpha=0.7):
-        """
-        Plot the clusters discovered by the model.
-        """
-        if X is None:
-            X = self.data
-            assignments = self.cluster_assignments
-        else:
-            X = np.asarray(X)
-            assignments = self.predict(X)
-        
-        fig, ax = plt.subplots(figsize=figsize)
-        
-        unique_clusters = np.unique(assignments)
-        for cluster in unique_clusters:
-            if cluster == -1:  # New cluster prediction
-                continue
-            mask = assignments == cluster
-            ax.scatter(X[mask, dims[0]], X[mask, dims[1]], alpha=alpha, label=f'Cluster {cluster}')
-        
-        ax.set_xlabel(f'Dimension {dims[0]}')
-        ax.set_ylabel(f'Dimension {dims[1]}')
-        ax.set_title('DPMM Clustering Results')
-        ax.legend()
-        
-        return fig
-    
-    def plot_posterior_trace(self, figsize=(10, 6)):
-        """
-        Plot the trace of the number of clusters over MCMC iterations.
-        """
-        n_clusters = [len(set(sample)) for sample in self.samples]
-        
-        fig, ax = plt.subplots(figsize=figsize)
-        
-        ax.plot(n_clusters)
-        ax.set_xlabel('Sample Index')
-        ax.set_ylabel('Number of Clusters')
-        ax.set_title('Posterior Trace of Number of Clusters')
-        
-        return fig
-    
-    def plot_cluster_sizes(self, figsize=(10, 6)):
+    def plot_cluster_sizes(self):
         """
         Plot the distribution of cluster sizes.
         """
-        cluster_sizes = list(self.cluster_counts.values())
+        counts = self.cluster_counts
         
-        fig, ax = plt.subplots(figsize=figsize)
+        sorted_clusters = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+        cluster_labels = [f"Cluster {k}" for k, _ in sorted_clusters]
+        cluster_sizes = [v for _, v in sorted_clusters]
         
-        ax.bar(range(len(cluster_sizes)), sorted(cluster_sizes, reverse=True))
-        ax.set_xlabel('Cluster Rank')
-        ax.set_ylabel('Cluster Size')
-        ax.set_title('Distribution of Cluster Sizes')
+        plt.figure(figsize=(10, 6))
+        bars = plt.bar(range(len(cluster_labels)), cluster_sizes, color='skyblue')
         
-        return fig
-    
-    def plot_pairwise_features(self, X=None, max_dims=5, figsize=(12, 10)):
-        """
-        Plot pairwise feature relationships colored by cluster assignment.
-        """
-        if X is None:
-            X = self.data
-            assignments = self.cluster_assignments
-        else:
-            X = np.asarray(X)
-            assignments = self.predict(X)
+        for i, bar in enumerate(bars):
+            height = bar.get_height()
+            plt.text(bar.get_x() + bar.get_width()/2., height + 0.5,
+                    f'{cluster_sizes[i]}',
+                    ha='center', va='bottom')
         
-        d = X.shape[1]
-        # d = min(X.shape[1], max_dims)
-        X_plot = X[:, :d]
-        
-        unique_clusters = np.unique(assignments)
-        n_clusters = len(unique_clusters)
-        colors = plt.cm.viridis(np.linspace(0, 1, n_clusters))
-        
-        fig, axes = plt.subplots(d, d, figsize=figsize)
-        fig.subplots_adjust(hspace=0.05, wspace=0.05)
-        
-        cluster_to_color = {cluster: i for i, cluster in enumerate(unique_clusters)}
-        
-        for i in range(d):
-            for j in range(d):
-                ax = axes[i, j]
-                
-                ax.tick_params(axis='both', which='both', labelsize=8)
-                
-                if i == j:  
-                    for cluster in unique_clusters:
-                        mask = assignments == cluster
-                        ax.hist(X_plot[mask, i], bins=15, alpha=0.5, 
-                                color=colors[cluster_to_color[cluster]], 
-                                density=True, label=f'Cluster {cluster}')
-                    
-                    if j == 0:
-                        ax.set_ylabel(f'Feature {i}', fontsize=10)
-                    else:
-                        ax.set_ylabel('')
-                        ax.set_yticklabels([])
-                    
-                    if i == d-1:
-                        ax.set_xlabel(f'Feature {j}', fontsize=10)
-                    else:
-                        ax.set_xlabel('')
-                        ax.set_xticklabels([])
-                        
-                else: 
-                    for cluster in unique_clusters:
-                        mask = assignments == cluster
-                        ax.scatter(X_plot[mask, j], X_plot[mask, i], 
-                                  c=[colors[cluster_to_color[cluster]]], 
-                                  alpha=0.6, s=20, label=f'Cluster {cluster}')
-                    
-                    if j == 0:
-                        ax.set_ylabel(f'Feature {i}', fontsize=10)
-                    else:
-                        ax.set_ylabel('')
-                        ax.set_yticklabels([])
-                    
-                    if i == d-1:
-                        ax.set_xlabel(f'Feature {j}', fontsize=10)
-                    else:
-                        ax.set_xlabel('')
-                        ax.set_xticklabels([])
-        
-        handles, labels = axes[0, 0].get_legend_handles_labels()
-        fig.legend(handles, labels, loc='upper right', bbox_to_anchor=(0.99, 0.99), 
-                  fontsize=10, frameon=True)
-        
-        fig.suptitle('Pairwise Feature Relationships by Cluster', y=1.02, fontsize=14)
+        plt.xlabel('Cluster')
+        plt.ylabel('Number of Data Points')
+        plt.title('Distribution of Cluster Sizes')
+        plt.xticks(range(len(cluster_labels)), cluster_labels, rotation=45, ha='right')
         plt.tight_layout()
         
-        return fig
+    
+    def animate_assignments(self, save_path="dpmm_niw_animation.gif", interval=300, dpi=150):
+        """
+        Create an animation (GIF) showing evolution of cluster assignments (only for 2D data).
+        """
+        if self.d != 2:
+            print("Animation is only supported for 2D data.")
+            return
+        
+        fig, ax = plt.subplots(figsize=(8,6))
+        ax.set_xlabel("Dimension 1")
+        ax.set_ylabel("Dimension 2")
+        title = ax.text(0.5, 1.03, "", transform=ax.transAxes, ha="center")
+        scat = ax.scatter([], [], s=50)
+        
+        def init():
+            scat.set_offsets([])
+            title.set_text("")
+            return scat, title
+        
+        def animate(i):
+            assignments = self.assignment_history[i]
+            clusters = np.unique(assignments)
+            colors = {}
+            cmap = plt.cm.tab10
+            for j, k in enumerate(clusters):
+                colors[k] = cmap(j % 10)
+            point_colors = [colors[lab] for lab in assignments]
+            offsets = self.data
+            scat.set_offsets(offsets)
+            scat.set_color(point_colors)
+            title.set_text(f"Iteration {i}")
+            return scat, title
+        
+        anim = animation.FuncAnimation(fig, animate, init_func=init,
+                                       frames=len(self.assignment_history), interval=interval, blit=True)
+        anim.save(save_path, writer="imagemagick", dpi=dpi)
+        plt.close(fig)
+        
+    def predict(self, X_new):
+        """
+        Predict cluster assignments for new data points.
+        """
+        X_new = np.asarray(X_new)
+        if X_new.ndim == 1:
+            X_new = X_new.reshape(1, -1)
+            
+        if X_new.shape[1] != self.d:
+            raise ValueError(f"New data has {X_new.shape[1]} features, but model was trained with {self.d} features.")
+            
+        n_new = X_new.shape[0]
+        z_new = np.zeros(n_new, dtype=int)
+        
+        existing_clusters = list(self.params.keys())
+        
+        for i in range(n_new):
+            probs = []
+            
+            for k in existing_clusters:
+                mu_k, Sigma_k = self.params[k]
+                # Get count of points in this cluster
+                n_k = np.sum(self.z == k)
+                # Compute likelihood of x_i given cluster k parameters
+                likelihood = multivariate_normal.pdf(X_new[i], mean=mu_k, cov=Sigma_k)
+                probs.append(n_k * likelihood)
+            
+            # Probability for a new cluster (using the NIW predictive density)
+            new_prob = self.alpha * self._predictive_density(X_new[i])
+            probs.append(new_prob)
+            
+            # Normalize probabilities
+            probs = np.array(probs)
+            probs /= np.sum(probs)
+            
+            # Assign to the most probable cluster
+            choice = np.argmax(probs)
+            if choice == len(existing_clusters):
+                z_new[i] = -1
+            else:
+                z_new[i] = existing_clusters[choice]
+                
+        return z_new
 
+def compute_cluster_purity(true_labels, cluster_assignments):
+    clusters = np.unique(cluster_assignments)
+    correct_assignments = 0
+    
+    for cluster in clusters:
+        cluster_indices = np.where(cluster_assignments == cluster)[0]
+        
+        cluster_true_labels = true_labels[cluster_indices]
+        if len(cluster_true_labels) > 0:
+            label_counts = Counter(cluster_true_labels)
+            most_common_label = label_counts.most_common(1)[0][0]
+            correct_assignments += np.sum(cluster_true_labels == most_common_label)
+    
+    purity = correct_assignments / len(true_labels)
+    
+    return purity
 
-
-def generate_mixture_data(n_samples=500, n_components=3, random_state=None):
-    """
-    Makes example data to test DirichletProcessMixtureModel.
-    """
-    if random_state is not None:
-        np.random.seed(random_state)
+# Example usage:
+if __name__ == "__main__":
+    np.random.seed(42)
+    n_samples = 300
+    d = 2
+    centers = np.array([[0, 0], [5, 5], [-5, 5]])
+    data = []
+    for center in centers:
+        data.append(np.random.multivariate_normal(center, np.eye(d), size=n_samples//3))
+    data = np.vstack(data)
     
-    weights = np.random.dirichlet(np.ones(n_components))
-    
-    means = np.random.randn(n_components, 2) * 5
-    covs = np.array([np.eye(2) * (0.5 + np.random.rand()) for _ in range(n_components)])
-    
-    X = np.zeros((n_samples, 2))
-    t = np.zeros(n_samples, dtype=int)
-    
-    component_assignments = np.random.choice(n_components, size=n_samples, p=weights)
-    for i in range(n_samples):
-        comp = component_assignments[i]
-        X[i] = np.random.multivariate_normal(means[comp], covs[comp])
-        t[i] = comp
-    
-    return X, t
-
-
-def compute_cluster_purity(t, y):
-    """
-    Returns the purity score (0-1) of clustering labels.
-    """
-    contingency = np.zeros((len(set(t)), len(set(y))))
-    
-    for i in range(len(t)):
-        contingency[t[i], y[i]] += 1
-    
-    return np.sum(np.max(contingency, axis=0)) / len(t)
+    model = DirichletProcessMixtureModel(data, alpha=1.0, kappa0=1.0, nu0=d+2, Lambda0=np.eye(d))
